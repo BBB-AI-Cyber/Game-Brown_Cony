@@ -23,9 +23,61 @@
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const W = 960, H = 540, GROUND = 450, GRAVITY = 0.9;
 
+// ---------- 音效（Web Audio 合成，不需要音檔） ----------
+let actx = null, master = null, muted = false;
+function unlockAudio() {
+  if (!actx) {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = 0.5; master.connect(actx.destination);
+  }
+  if (actx.state === 'suspended') actx.resume();
+}
+function tone(freq, dur, type = 'square', vol = 0.2, slideTo = 0, delay = 0) {
+  if (!actx || muted) return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur);
+}
+function noise(dur, vol = 0.3, freq = 1200) {
+  if (!actx || muted) return;
+  const t = actx.currentTime, len = actx.sampleRate * dur | 0, buf = actx.createBuffer(1, len, actx.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  const s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  s.buffer = buf; f.type = 'lowpass'; f.frequency.value = freq;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t);
+}
+const sfx = {
+  light() { noise(0.08, 0.35, 2500); tone(220, 0.08, 'square', 0.12, 110); },
+  heavy() { noise(0.2, 0.5, 900); tone(130, 0.25, 'sawtooth', 0.2, 50); },
+  block() { tone(900, 0.06, 'triangle', 0.15); tone(1300, 0.08, 'triangle', 0.1, 0, 0.03); },
+  whoosh() { noise(0.12, 0.12, 4000); },
+  jump() { tone(300, 0.15, 'square', 0.08, 700); },
+  carrot() { tone(600, 0.2, 'triangle', 0.12, 1200); },
+  super() { [0, 0.08, 0.16, 0.24].forEach((d, i) => tone(330 * (1 + i * 0.25), 0.25, 'square', 0.12, 0, d)); },
+  ko() { tone(400, 0.9, 'sawtooth', 0.2, 60); noise(0.6, 0.4, 600); },
+  start() { tone(523, 0.12, 'square', 0.12); tone(784, 0.3, 'square', 0.12, 0, 0.15); },
+  win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.25, 'square', 0.12, 0, i * 0.15)); },
+  lose() { [392, 330, 262].forEach((f, i) => tone(f, 0.35, 'triangle', 0.15, 0, i * 0.25)); },
+  select() { tone(880, 0.06, 'square', 0.08); },
+};
+// 背景音樂：簡單的循環旋律
+const BGM_BASS = [110, 0, 110, 0, 131, 0, 98, 0], BGM_MEL = [440, 523, 587, 523, 440, 392, 440, 0, 523, 587, 659, 587, 523, 440, 392, 0];
+let bgmStep = 0, bgmTick = 0;
+function bgmUpdate() {
+  if (++bgmTick < 9) return; bgmTick = 0;
+  const b = BGM_BASS[bgmStep % 8], m = BGM_MEL[bgmStep % 16];
+  if (b) tone(b, 0.18, 'triangle', 0.16);
+  if (m && bgmStep % 2 === 0) tone(m, 0.14, 'square', 0.035);
+  bgmStep++;
+}
+
 // ---------- 輸入 ----------
 const keys = {}, pressed = {};
-addEventListener('keydown', e => { const k = e.key.toLowerCase(); if (!keys[k]) pressed[k] = true; keys[k] = true; });
+addEventListener('keydown', e => { unlockAudio(); const k = e.key.toLowerCase(); if (k === 'm' && !keys[k]) muted = !muted; if (!keys[k]) pressed[k] = true; keys[k] = true; });
+addEventListener('pointerdown', unlockAudio);
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 document.querySelectorAll('#pad button').forEach(b => {
   const k = b.dataset.k;
@@ -74,7 +126,8 @@ class Fighter {
     const m = this.d.moves[name];
     if (name === 'super' && this.meter < 100) return;
     if (name === 'special' && this.cd > 0) return;
-    if (name === 'super') { this.meter = 0; superFlash = { who: this, t: 50, name: m.name }; }
+    if (name === 'super') { this.meter = 0; superFlash = { who: this, t: 50, name: m.name }; sfx.super(); }
+    else sfx.whoosh();
     if (name === 'special') this.cd = m.cd;
     this.state = 'attack'; this.move = m; this.moveName = name; this.t = 0; this.hitDone = 0;
   }
@@ -92,8 +145,8 @@ class Fighter {
       this.vx = dir * this.d.speed;
       if (dir) this.walk += 0.25;
       if (inp.jump) {
-        if (this.onGround) this.vy = -this.d.jump;
-        else if (this.airJumps > 0) { this.vy = -this.d.jump * 0.85; this.airJumps--; }
+        if (this.onGround) { this.vy = -this.d.jump; sfx.jump(); }
+        else if (this.airJumps > 0) { this.vy = -this.d.jump * 0.85; this.airJumps--; sfx.jump(); }
       }
       if (inp.superA) this.startMove('super');
       else if (inp.special) this.startMove('special');
@@ -118,7 +171,7 @@ class Fighter {
 
   tryHit(foe, m) {
     if (m.projectile) {
-      if (!this.hitDone) { projectiles.push(new Carrot(this)); this.hitDone = 1; }
+      if (!this.hitDone) { projectiles.push(new Carrot(this)); this.hitDone = 1; sfx.carrot(); }
       return;
     }
     const hits = m.multi || 1;
@@ -138,7 +191,7 @@ class Fighter {
       this.hp -= dmg * 0.15; this.vx = dir * push * 0.6;
       this.meter = Math.min(100, this.meter + 4);
       sparks.push(new Pop(this.x - dir * 30, this.y - 110, '擋！', '#7fd1ff'));
-      hitStop = 3; return;
+      sfx.block(); hitStop = 3; return;
     }
     this.hp -= dmg;
     from.meter = Math.min(100, from.meter + dmg * 2.2);
@@ -150,6 +203,7 @@ class Fighter {
       this.vx = dir * push; if (push > 10) this.vy = -8;
     }
     hitStop = dmg > 10 ? 8 : 4; shake = Math.min(12, dmg);
+    dmg > 8 ? sfx.heavy() : sfx.light();
     const words = ['啪！', '咚！', '砰！', '碰！'];
     sparks.push(new Pop(this.x - dir * 20, this.y - 130, words[Math.random() * 4 | 0], '#ffd23f'));
   }
@@ -282,14 +336,14 @@ function startRound() {
   player = new Fighter(player.type, 250, 1); cpu = new Fighter(cpu.type, 710, -1);
   player.wins = pw; cpu.wins = cw;
   projectiles = []; sparks = []; timer = 60 * 60; roundOver = 0; superFlash = null;
-  banner = { txt: `第 ${round} 回合`, t: 90, sub: '開打！' };
+  banner = { txt: `第 ${round} 回合`, t: 90, sub: '開打！' }; sfx.start();
 }
 function endRound() {
   let txt;
   if (player.hp > cpu.hp) { player.wins++; txt = `${player.d.name} 勝！`; }
   else if (cpu.hp > player.hp) { cpu.wins++; txt = `${cpu.d.name} 勝！`; }
   else txt = '平手！';
-  roundOver = 150; banner = { txt: player.hp <= 0 || cpu.hp <= 0 ? 'K.O.!' : '時間到！', t: 150, sub: txt };
+  roundOver = 150; banner = { txt: player.hp <= 0 || cpu.hp <= 0 ? 'K.O.!' : '時間到！', t: 150, sub: txt }; sfx.ko();
 }
 
 function playerInput() {
@@ -302,8 +356,8 @@ function playerInput() {
 
 function update() {
   if (scene === 'select') {
-    if (pressed.a || pressed.arrowleft || pressed['1']) pick = 'cony';
-    if (pressed.d || pressed.arrowright || pressed['2']) pick = 'brown';
+    if (pressed.a || pressed.arrowleft || pressed['1']) { pick = 'cony'; sfx.select(); }
+    if (pressed.d || pressed.arrowright || pressed['2']) { pick = 'brown'; sfx.select(); }
     if (pressed.enter || pressed.j || pressed[' ']) startMatch();
     return;
   }
@@ -316,13 +370,14 @@ function update() {
 
   if (roundOver) {
     if (--roundOver === 0) {
-      if (player.wins >= 2 || cpu.wins >= 2) scene = 'end';
+      if (player.wins >= 2 || cpu.wins >= 2) { scene = 'end'; player.wins >= 2 ? sfx.win() : sfx.lose(); }
       else { round++; startRound(); }
     }
     sparks.forEach(s => s.update()); sparks = sparks.filter(s => s.t > 0);
     return;
   }
   const fighting = !banner || banner.t < 40;
+  bgmUpdate();
   player.input = fighting ? playerInput() : {};
   cpu.input = fighting ? aiInput(cpu, player) : {};
   // 必殺技演出期間，被凝視的一方定身
@@ -377,6 +432,7 @@ function drawHud() {
   ctx.fillStyle = '#000a'; ctx.fillRect(W / 2 - 40, 14, 80, 54);
   ctx.fillStyle = '#fff'; ctx.font = 'bold 36px sans-serif'; ctx.textAlign = 'center';
   ctx.fillText(Math.ceil(timer / 60), W / 2, 54);
+  ctx.font = '22px sans-serif'; ctx.fillText(muted ? '🔇' : '🔊', W / 2, 96);
 }
 function bar(x, y, f, right) {
   const w = 360, dir = right ? -1 : 1, x0 = right ? x - w : x;
@@ -433,7 +489,7 @@ function draw() {
   if (scene === 'fight' && round === 1 && timer > 55 * 60) {
     ctx.fillStyle = '#000a'; ctx.fillRect(W / 2 - 330, 470, 660, 50);
     ctx.fillStyle = '#fff'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('A D 移動｜W 跳｜S 防禦｜J 輕攻擊｜K 重攻擊｜L 特殊技｜I 必殺技', W / 2, 502);
+    ctx.fillText('A D 移動｜W 跳｜S 防禦｜J 輕｜K 重｜L 特殊技｜I 必殺技｜M 靜音', W / 2, 502);
   }
 }
 function centerTextAt(txt, x, y, on) {
@@ -441,10 +497,11 @@ function centerTextAt(txt, x, y, on) {
 }
 
 cv.addEventListener('pointerdown', e => {
+  const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
+  if (scene === 'fight' && Math.abs(x - W / 2) < 30 && y > 72 && y < 110) { muted = !muted; return; }
   if (scene === 'select') {
-    const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) / r.width * W;
     const k = x < W / 2 ? 'cony' : 'brown';
-    if (k === pick) startMatch(); else pick = k;
+    if (k === pick) startMatch(); else { pick = k; sfx.select(); }
   } else if (scene === 'end') scene = 'select';
 });
 

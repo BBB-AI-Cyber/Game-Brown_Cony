@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>熊兔大亂鬥</title>
+<style>
+  html,body{margin:0;height:100%;background:#1b1d22;overflow:hidden;font-family:sans-serif;touch-action:none}
+  canvas{display:block;margin:0 auto;max-width:100vw;max-height:100vh;aspect-ratio:16/9}
+  #pad{position:fixed;inset:auto 0 0 0;display:none;justify-content:space-between;padding:12px;pointer-events:none}
+  #pad div{display:flex;gap:8px;pointer-events:auto}
+  #pad button{width:56px;height:56px;border-radius:50%;border:0;background:#fff8;font-size:16px;font-weight:bold}
+  @media (pointer:coarse){#pad{display:flex}}
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+<div id="pad">
+  <div><button data-k="a">◀</button><button data-k="w">▲</button><button data-k="s">▼</button><button data-k="d">▶</button></div>
+  <div><button data-k="j">輕</button><button data-k="k">重</button><button data-k="l">特</button><button data-k="i">必</button></div>
+</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 960, H = 540, GROUND = 450, GRAVITY = 0.9;
+
+// ---------- 輸入 ----------
+const keys = {}, pressed = {};
+addEventListener('keydown', e => { const k = e.key.toLowerCase(); if (!keys[k]) pressed[k] = true; keys[k] = true; });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k;
+  b.addEventListener('pointerdown', e => { e.preventDefault(); if (!keys[k]) pressed[k] = true; keys[k] = true; });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => b.addEventListener(t, () => keys[k] = false));
+});
+
+// ---------- 角色資料 ----------
+const CHARS = {
+  cony: {
+    name: '兔兔', hp: 100, speed: 5.2, jump: 17, airJumps: 1,
+    body: '#f7f4ef', shade: '#ddd8cf',
+    moves: {
+      light:   { dmg: 4,  range: 70,  startup: 4,  active: 4, recovery: 6,  push: 3,  name: '耳朵拍打' },
+      heavy:   { dmg: 9,  range: 95,  startup: 9,  active: 5, recovery: 14, push: 9,  name: '兔兔飛踢' },
+      special: { dmg: 7,  startup: 10, active: 1, recovery: 16, projectile: true, cost: 0, cd: 60, name: '胡蘿蔔飛鏢' },
+      super:   { dmg: 26, range: 120, startup: 12, active: 30, recovery: 18, push: 4, multi: 6, name: '腮紅暴走' },
+    },
+  },
+  brown: {
+    name: '熊大', hp: 130, speed: 3.6, jump: 15, airJumps: 0, armor: true,
+    body: '#8a5a33', shade: '#6e4526',
+    moves: {
+      light:   { dmg: 6,  range: 75,  startup: 6,  active: 4, recovery: 9,  push: 4,  name: '熊掌巴頭' },
+      heavy:   { dmg: 14, range: 100, startup: 14, active: 6, recovery: 18, push: 12, name: '泰山壓頂' },
+      special: { dmg: 12, range: 70,  startup: 8,  active: 4, recovery: 22, push: 14, grab: true, cd: 45, name: '熊抱' },
+      super:   { dmg: 30, range: 999, startup: 20, active: 1, recovery: 20, push: 18, stare: true, name: '無表情凝視' },
+    },
+  },
+};
+
+// ---------- 鬥士 ----------
+class Fighter {
+  constructor(type, x, facing) {
+    this.type = type; this.d = CHARS[type];
+    this.x = x; this.y = GROUND; this.vx = 0; this.vy = 0; this.facing = facing;
+    this.hp = this.d.hp; this.meter = 0; this.wins = this.wins || 0;
+    this.state = 'idle'; this.t = 0; this.move = null; this.hitDone = 0;
+    this.airJumps = this.d.airJumps; this.blocking = false; this.stun = 0; this.cd = 0; this.walk = 0;
+    this.input = {};
+  }
+  get onGround() { return this.y >= GROUND; }
+  get busy() { return this.state === 'attack' || this.stun > 0; }
+
+  startMove(name) {
+    const m = this.d.moves[name];
+    if (name === 'super' && this.meter < 100) return;
+    if (name === 'special' && this.cd > 0) return;
+    if (name === 'super') { this.meter = 0; superFlash = { who: this, t: 50, name: m.name }; }
+    if (name === 'special') this.cd = m.cd;
+    this.state = 'attack'; this.move = m; this.moveName = name; this.t = 0; this.hitDone = 0;
+  }
+
+  update(foe) {
+    const inp = this.input;
+    if (this.cd > 0) this.cd--;
+    if (this.stun > 0) { this.stun--; if (this.stun === 0 && this.state === 'hit') this.state = 'idle'; }
+
+    if (!this.busy) {
+      this.facing = foe.x > this.x ? 1 : -1;
+      this.blocking = inp.down && this.onGround;
+      let dir = (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+      if (this.blocking) dir = 0;
+      this.vx = dir * this.d.speed;
+      if (dir) this.walk += 0.25;
+      if (inp.jump) {
+        if (this.onGround) this.vy = -this.d.jump;
+        else if (this.airJumps > 0) { this.vy = -this.d.jump * 0.85; this.airJumps--; }
+      }
+      if (inp.superA) this.startMove('super');
+      else if (inp.special) this.startMove('special');
+      else if (inp.heavy) this.startMove('heavy');
+      else if (inp.light) this.startMove('light');
+    }
+
+    if (this.state === 'attack') {
+      const m = this.move; this.t++;
+      if (this.onGround) this.vx *= 0.7;
+      if (this.moveName === 'super' && this.type === 'cony' && this.t > m.startup) this.vx = this.facing * 6;
+      const activeStart = m.startup, activeEnd = m.startup + m.active;
+      if (this.t > activeStart && this.t <= activeEnd) this.tryHit(foe, m);
+      if (this.t > activeEnd + m.recovery) { this.state = 'idle'; this.move = null; }
+    }
+
+    this.vy += GRAVITY; this.x += this.vx; this.y += this.vy;
+    if (this.y >= GROUND) { this.y = GROUND; this.vy = 0; this.airJumps = this.d.airJumps; }
+    this.x = Math.max(60, Math.min(W - 60, this.x));
+    if (this.state === 'hit') this.vx *= 0.85;
+  }
+
+  tryHit(foe, m) {
+    if (m.projectile) {
+      if (!this.hitDone) { projectiles.push(new Carrot(this)); this.hitDone = 1; }
+      return;
+    }
+    const hits = m.multi || 1;
+    if (this.hitDone >= hits) return;
+    if (m.multi && (this.t - m.startup) % Math.floor(m.active / hits) !== 1) return;
+    const dist = (foe.x - this.x) * this.facing;
+    if (m.stare || (dist > -20 && dist < m.range + 40 && Math.abs(foe.y - this.y) < 120)) {
+      this.hitDone++;
+      foe.takeHit(this, m.multi ? m.dmg / hits : m.dmg, m.push, !!m.grab || !!m.stare);
+    }
+  }
+
+  takeHit(from, dmg, push, unblockable) {
+    if (roundOver) return;
+    const dir = from.x < this.x ? 1 : -1;
+    if (this.blocking && !unblockable && this.facing === -dir) {
+      this.hp -= dmg * 0.15; this.vx = dir * push * 0.6;
+      this.meter = Math.min(100, this.meter + 4);
+      sparks.push(new Pop(this.x - dir * 30, this.y - 110, '擋！', '#7fd1ff'));
+      hitStop = 3; return;
+    }
+    this.hp -= dmg;
+    from.meter = Math.min(100, from.meter + dmg * 2.2);
+    this.meter = Math.min(100, this.meter + dmg * 1.4);
+    // 熊大霸體：輕攻擊打不斷他的攻擊
+    const armored = this.d.armor && this.state === 'attack' && dmg < 8;
+    if (!armored) {
+      this.state = 'hit'; this.move = null; this.stun = 12 + push;
+      this.vx = dir * push; if (push > 10) this.vy = -8;
+    }
+    hitStop = dmg > 10 ? 8 : 4; shake = Math.min(12, dmg);
+    const words = ['啪！', '咚！', '砰！', '碰！'];
+    sparks.push(new Pop(this.x - dir * 20, this.y - 130, words[Math.random() * 4 | 0], '#ffd23f'));
+  }
+
+  draw() {
+    const { x, y, facing: f, d } = this;
+    const bob = this.state === 'idle' && this.onGround ? Math.sin(Date.now() / 200) * 2 : 0;
+    const step = Math.sin(this.walk) * (this.vx ? 10 : 0);
+    ctx.save(); ctx.translate(x, y + bob);
+    if (this.state === 'hit') ctx.rotate(-f * 0.15);
+    if (superFlash && superFlash.who === this) { ctx.shadowColor = this.type === 'cony' ? '#ff7fa8' : '#ffb347'; ctx.shadowBlur = 30; }
+
+    // 影子
+    ctx.fillStyle = '#0004'; ctx.beginPath(); ctx.ellipse(0, GROUND - y - bob, 50, 10, 0, 0, 7); ctx.fill();
+
+    const atk = this.state === 'attack' && this.t > this.move.startup;
+    // 腳
+    ctx.fillStyle = d.shade;
+    const kick = atk && this.moveName === 'heavy' && this.type === 'cony';
+    ell(-18 - step, -18, 16, 20); ell(kick ? 50 * f : 18 + step, kick ? -45 : -18, 16, 20);
+    // 身體
+    ctx.fillStyle = d.body; ell(0, -70, 42, 48);
+    // 手
+    ctx.fillStyle = d.shade;
+    const punch = atk && (this.moveName === 'light' || this.moveName === 'special' || this.moveName === 'super');
+    ell(-38 * f, -75, 13, 22);
+    ell(punch ? 70 * f : 38 * f, punch ? -95 : -75, 14, punch ? 14 : 22);
+
+    // 頭
+    ctx.translate(0, -165);
+    if (this.type === 'cony') {
+      ctx.fillStyle = d.body; ell(-28, -80, 18, 48); ell(28, -80, 18, 48);
+      ctx.fillStyle = '#f7a6b8'; ell(-28, -80, 8, 34); ell(28, -80, 8, 34);
+      ctx.fillStyle = d.body; ell(0, 0, 80, 70);
+      const blush = superFlash && superFlash.who === this ? '#ff4f86' : '#f7a6b8';
+      ctx.fillStyle = blush; ell(-45, 18, 16, 11); ell(45, 18, 16, 11);
+      this.face(-22, 22, 0, 5, '#222');
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+      ell(0, 15, 7, 5); ctx.stroke();
+      ctx.lineWidth = 3; ctx.beginPath();
+      if (this.state === 'hit') { ctx.arc(0, 40, 12, Math.PI * 1.15, Math.PI * 1.85); }
+      else { ctx.arc(0, 22, 14, 0.2 * Math.PI, 0.8 * Math.PI); }
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = d.body; ell(-60, -55, 22, 22); ell(60, -55, 22, 22);
+      ctx.fillStyle = d.shade; ell(-60, -55, 11, 11); ell(60, -55, 11, 11);
+      ctx.fillStyle = d.body; ell(0, 0, 85, 78);
+      ctx.fillStyle = '#efd9bf'; ell(0, 28, 34, 28);
+      this.face(-30, 30, -8, 6, '#111');
+      ctx.fillStyle = '#111'; ell(0, 16, 9, 6);
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 3; ctx.beginPath();
+      ctx.moveTo(0, 22); ctx.lineTo(0, 30); ctx.moveTo(-10, 40); ctx.lineTo(0, 30); ctx.lineTo(10, 40); ctx.stroke();
+    }
+    if (this.blocking) {
+      ctx.restore(); ctx.save(); ctx.globalAlpha = 0.35; ctx.fillStyle = '#7fd1ff';
+      ctx.beginPath(); ctx.arc(x + this.facing * 45, y - 110, 70, -1.2, 1.2); if (this.facing < 0) { ctx.beginPath(); ctx.arc(x - 45, y - 110, 70, Math.PI - 1.2, Math.PI + 1.2); }
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  face(lx, rx, ey, r, c) {
+    ctx.fillStyle = c;
+    if (this.state === 'hit') {
+      ctx.strokeStyle = c; ctx.lineWidth = 3;
+      [lx, rx].forEach(ex => { ctx.beginPath(); ctx.moveTo(ex - 6, ey - 6); ctx.lineTo(ex + 6, ey + 6); ctx.moveTo(ex + 6, ey - 6); ctx.lineTo(ex - 6, ey + 6); ctx.stroke(); });
+    } else { ell(lx, ey, r, r); ell(rx, ey, r, r); }
+  }
+}
+function ell(x, y, rx, ry) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, 7); ctx.fill(); }
+
+class Carrot {
+  constructor(o) { this.o = o; this.x = o.x + o.facing * 50; this.y = o.y - 120; this.vx = o.facing * 10; this.dead = false; }
+  update(foe) {
+    this.x += this.vx;
+    if (this.x < 0 || this.x > W) this.dead = true;
+    if (Math.abs(this.x - foe.x) < 45 && Math.abs(this.y - (foe.y - 100)) < 90) {
+      foe.takeHit(this.o, CHARS.cony.moves.special.dmg, 5, false); this.dead = true;
+    }
+  }
+  draw() {
+    ctx.save(); ctx.translate(this.x, this.y); ctx.rotate(Date.now() / 50);
+    ctx.fillStyle = '#ff8a1f'; ctx.beginPath(); ctx.moveTo(-22, -7); ctx.lineTo(22, 0); ctx.lineTo(-22, 7); ctx.fill();
+    ctx.fillStyle = '#3db54a'; ell(-24, 0, 7, 4); ctx.restore();
+  }
+}
+class Pop {
+  constructor(x, y, txt, c) { this.x = x; this.y = y; this.txt = txt; this.c = c; this.t = 30; }
+  update() { this.t--; this.y -= 1.5; }
+  draw() {
+    ctx.globalAlpha = this.t / 30; ctx.font = 'bold 34px sans-serif'; ctx.textAlign = 'center';
+    ctx.lineWidth = 5; ctx.strokeStyle = '#000'; ctx.strokeText(this.txt, this.x, this.y);
+    ctx.fillStyle = this.c; ctx.fillText(this.txt, this.x, this.y); ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- 電腦 AI ----------
+const AI_LEVEL = { reaction: 14 };
+let aiThink = 0, aiPlan = {};
+function aiInput(me, foe) {
+  if (--aiThink > 0) return aiPlan;
+  aiThink = AI_LEVEL.reaction * (0.6 + Math.random() * 0.8) | 0;
+  const dist = Math.abs(foe.x - me.x), toward = foe.x > me.x ? 'right' : 'left', away = toward === 'right' ? 'left' : 'right';
+  const p = {}, r = Math.random();
+  const foeAttacking = foe.state === 'attack' && foe.t < foe.move.startup + 2;
+  const carrotNear = projectiles.some(c => c.o === foe && Math.abs(c.x - me.x) < 200);
+  if (me.meter >= 100 && dist < 140 && r < 0.6) p.superA = true;
+  else if ((foeAttacking || carrotNear) && dist < 160 && r < 0.55) { p.down = true; aiThink = 18; }
+  else if (me.type === 'cony' && dist > 300 && me.cd === 0 && r < 0.5) p.special = true;
+  else if (dist > 90) { p[toward] = true; if (r < 0.08) p.jump = true; }
+  else if (me.type === 'brown' && foe.blocking && me.cd === 0 && r < 0.6) p.special = true;
+  else if (r < 0.45) p.light = true;
+  else if (r < 0.75) p.heavy = true;
+  else if (r < 0.88) p[away] = true;
+  else p.down = true;
+  aiPlan = p; return p;
+}
+
+// ---------- 遊戲流程 ----------
+let scene = 'select', pick = 'cony', player, cpu, projectiles = [], sparks = [];
+let hitStop = 0, shake = 0, superFlash = null, timer = 0, round = 1, roundOver = 0, banner = null;
+
+function startMatch() {
+  const other = pick === 'cony' ? 'brown' : 'cony';
+  player = new Fighter(pick, 250, 1); cpu = new Fighter(other, 710, -1);
+  player.wins = cpu.wins = 0; round = 1; startRound();
+  scene = 'fight';
+}
+function startRound() {
+  const pw = player.wins, cw = cpu.wins;
+  player = new Fighter(player.type, 250, 1); cpu = new Fighter(cpu.type, 710, -1);
+  player.wins = pw; cpu.wins = cw;
+  projectiles = []; sparks = []; timer = 60 * 60; roundOver = 0; superFlash = null;
+  banner = { txt: `第 ${round} 回合`, t: 90, sub: '開打！' };
+}
+function endRound() {
+  let txt;
+  if (player.hp > cpu.hp) { player.wins++; txt = `${player.d.name} 勝！`; }
+  else if (cpu.hp > player.hp) { cpu.wins++; txt = `${cpu.d.name} 勝！`; }
+  else txt = '平手！';
+  roundOver = 150; banner = { txt: player.hp <= 0 || cpu.hp <= 0 ? 'K.O.!' : '時間到！', t: 150, sub: txt };
+}
+
+function playerInput() {
+  return {
+    left: keys.a || keys.arrowleft, right: keys.d || keys.arrowright, down: keys.s || keys.arrowdown,
+    jump: pressed.w || pressed.arrowup || pressed[' '],
+    light: pressed.j, heavy: pressed.k, special: pressed.l, superA: pressed.i,
+  };
+}
+
+function update() {
+  if (scene === 'select') {
+    if (pressed.a || pressed.arrowleft || pressed['1']) pick = 'cony';
+    if (pressed.d || pressed.arrowright || pressed['2']) pick = 'brown';
+    if (pressed.enter || pressed.j || pressed[' ']) startMatch();
+    return;
+  }
+  if (scene === 'end') { if (pressed.enter || pressed.j || pressed[' ']) scene = 'select'; return; }
+
+  if (banner && banner.t > 0) banner.t--;
+  if (superFlash) { superFlash.t--; if (superFlash.t <= 0) superFlash = null; }
+  if (hitStop > 0) { hitStop--; return; }
+  if (shake > 0) shake *= 0.85;
+
+  if (roundOver) {
+    if (--roundOver === 0) {
+      if (player.wins >= 2 || cpu.wins >= 2) scene = 'end';
+      else { round++; startRound(); }
+    }
+    sparks.forEach(s => s.update()); sparks = sparks.filter(s => s.t > 0);
+    return;
+  }
+  const fighting = !banner || banner.t < 40;
+  player.input = fighting ? playerInput() : {};
+  cpu.input = fighting ? aiInput(cpu, player) : {};
+  // 必殺技演出期間，被凝視的一方定身
+  const frozen = superFlash && superFlash.t > 20 ? superFlash.who : null;
+  if (!frozen || frozen === player) player.update(cpu);
+  if (!frozen || frozen === cpu) cpu.update(player);
+  // 推開重疊
+  const gap = cpu.x - player.x;
+  if (Math.abs(gap) < 70 && Math.abs(player.y - cpu.y) < 100) {
+    const push = (70 - Math.abs(gap)) / 2 * Math.sign(gap || 1);
+    player.x -= push; cpu.x += push;
+  }
+  projectiles.forEach(c => c.update(c.o === player ? cpu : player));
+  projectiles = projectiles.filter(c => !c.dead);
+  sparks.forEach(s => s.update()); sparks = sparks.filter(s => s.t > 0);
+  if (fighting) timer--;
+  if (player.hp <= 0 || cpu.hp <= 0 || timer <= 0) { player.hp = Math.max(0, player.hp); cpu.hp = Math.max(0, cpu.hp); endRound(); }
+}
+
+// ---------- 畫面 ----------
+function drawBg() {
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#c9ccd2'); g.addColorStop(1, '#8d9199');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const blds = [[0, 60, 180, '#5c5f66'], [170, 20, 150, '#6b6e75'], [310, 90, 120, '#777a80'], [520, 70, 130, '#73767c'], [640, 10, 170, '#62656c'], [800, 50, 160, '#5a5d63']];
+  blds.forEach(([x, y, w, c]) => {
+    ctx.fillStyle = c; ctx.fillRect(x, y, w, GROUND - y);
+    ctx.fillStyle = '#ffe9a855';
+    for (let wy = y + 20; wy < GROUND - 120; wy += 40) for (let wx = x + 15; wx < x + w - 20; wx += 35) ctx.fillRect(wx, wy, 18, 22);
+  });
+  sign(20, 150, '兔兔燈籠店', '#f4e9dc', '#b3261e', false);
+  sign(840, 110, '熊大商行', '#1f2a36', '#fff', true);
+  // 路燈
+  [430, 600].forEach(x => { ctx.fillStyle = '#333'; ctx.fillRect(x, 250, 6, GROUND - 250); ctx.fillStyle = '#ffe9a8'; ell(x + 3, 248, 12, 14); });
+  // 石板路
+  ctx.fillStyle = '#4a4c52'; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.strokeStyle = '#3a3c41'; ctx.lineWidth = 2;
+  for (let y = GROUND + 15; y < H; y += 22) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x, GROUND); ctx.lineTo(x + 30, H); ctx.stroke(); }
+}
+function sign(x, y, txt, bg, fg, vert) {
+  ctx.font = 'bold 26px sans-serif'; ctx.textAlign = 'center';
+  if (vert) {
+    ctx.fillStyle = bg; ctx.fillRect(x, y, 46, txt.length * 34 + 16); ctx.fillStyle = fg;
+    [...txt].forEach((ch, i) => ctx.fillText(ch, x + 23, y + 38 + i * 34));
+  } else {
+    const w = txt.length * 30 + 20; ctx.fillStyle = bg; ctx.fillRect(x, y, w, 44);
+    ctx.fillStyle = fg; ctx.fillText(txt, x + w / 2, y + 32);
+  }
+}
+function drawHud() {
+  bar(30, 24, player, false); bar(W - 30, 24, cpu, true);
+  ctx.fillStyle = '#000a'; ctx.fillRect(W / 2 - 40, 14, 80, 54);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 36px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(Math.ceil(timer / 60), W / 2, 54);
+}
+function bar(x, y, f, right) {
+  const w = 360, dir = right ? -1 : 1, x0 = right ? x - w : x;
+  ctx.fillStyle = '#000a'; ctx.fillRect(x0 - 3, y - 3, w + 6, 30);
+  ctx.fillStyle = '#c62828'; ctx.fillRect(x0, y, w, 24);
+  const hw = w * Math.max(0, f.hp) / f.d.hp;
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(right ? x - hw : x, y, hw, 24);
+  // 必殺量表
+  ctx.fillStyle = '#000a'; ctx.fillRect(x0, y + 32, 200 * (right ? 1 : 1), 10);
+  ctx.fillStyle = f.meter >= 100 ? (Date.now() % 300 < 150 ? '#ff4f86' : '#fff') : '#4fc3ff';
+  const mw = 200 * f.meter / 100; ctx.fillRect(right ? x - mw : x, y + 32, mw, 10);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = right ? 'right' : 'left';
+  ctx.fillText((f === player ? '你：' : '電腦：') + f.d.name + (f.meter >= 100 ? '  必殺OK！(I)' : ''), x, y + 64);
+  for (let i = 0; i < 2; i++) {
+    ctx.fillStyle = i < f.wins ? '#ffd23f' : '#0006';
+    ell(x + dir * (w - 10 - i * 22), y + 52, 8, 8);
+  }
+}
+function centerText(txt, y, size, c) {
+  ctx.font = `bold ${size}px sans-serif`; ctx.textAlign = 'center'; ctx.lineWidth = 8; ctx.strokeStyle = '#000';
+  ctx.strokeText(txt, W / 2, y); ctx.fillStyle = c; ctx.fillText(txt, W / 2, y);
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0.5) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  drawBg();
+  if (scene === 'select') {
+    ctx.fillStyle = '#0007'; ctx.fillRect(0, 0, W, H);
+    centerText('熊兔大亂鬥', 110, 64, '#ffd23f');
+    centerText('選擇你的角色（← → 選，Enter 開始）', 170, 24, '#fff');
+    const demo = { cony: new Fighter('cony', 300, 1), brown: new Fighter('brown', 660, -1) };
+    ['cony', 'brown'].forEach(k => {
+      const f = demo[k];
+      if (pick === k) { ctx.fillStyle = '#ffd23f55'; ell(f.x, GROUND - 10, 110, 22); }
+      ctx.globalAlpha = pick === k ? 1 : 0.5; f.draw(); ctx.globalAlpha = 1;
+      centerTextAt(f.d.name + (k === 'cony' ? '：敏捷・二段跳・飛鏢' : '：力量・霸體・熊抱'), f.x, 510, pick === k);
+    });
+    ctx.restore(); return;
+  }
+  if (superFlash) { ctx.fillStyle = `rgba(0,0,0,${Math.min(0.6, superFlash.t / 50)})`; ctx.fillRect(0, 0, W, H); }
+  [player, cpu].sort((a, b) => (a.state === 'attack') - (b.state === 'attack')).forEach(f => f.draw());
+  projectiles.forEach(c => c.draw());
+  sparks.forEach(s => s.draw());
+  ctx.restore();
+  drawHud();
+  if (superFlash && superFlash.t > 20) centerText(superFlash.name + '！', 230, 56, '#ff7fa8');
+  if (banner && banner.t > 0) { centerText(banner.txt, 240, 72, '#ffd23f'); centerText(banner.sub, 310, 40, '#fff'); }
+  if (scene === 'end') {
+    ctx.fillStyle = '#000a'; ctx.fillRect(0, 0, W, H);
+    centerText(player.wins >= 2 ? '你贏了！🎉' : '你輸了…', 230, 72, player.wins >= 2 ? '#ffd23f' : '#9ab');
+    centerText('按 Enter 再玩一次', 310, 30, '#fff');
+  }
+  if (scene === 'fight' && round === 1 && timer > 55 * 60) {
+    ctx.fillStyle = '#000a'; ctx.fillRect(W / 2 - 330, 470, 660, 50);
+    ctx.fillStyle = '#fff'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('A D 移動｜W 跳｜S 防禦｜J 輕攻擊｜K 重攻擊｜L 特殊技｜I 必殺技', W / 2, 502);
+  }
+}
+function centerTextAt(txt, x, y, on) {
+  ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = on ? '#ffd23f' : '#ccc'; ctx.fillText(txt, x, y);
+}
+
+cv.addEventListener('pointerdown', e => {
+  if (scene === 'select') {
+    const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) / r.width * W;
+    const k = x < W / 2 ? 'cony' : 'brown';
+    if (k === pick) startMatch(); else pick = k;
+  } else if (scene === 'end') scene = 'select';
+});
+
+let last = 0, acc = 0;
+function loop(ts) {
+  acc += Math.min(100, ts - last); last = ts;
+  while (acc >= 1000 / 60) { update(); for (const k in pressed) delete pressed[k]; acc -= 1000 / 60; }
+  draw(); requestAnimationFrame(loop);
+}
+requestAnimationFrame(t => { last = t; loop(t); });
+</script>
+</body>
+</html>

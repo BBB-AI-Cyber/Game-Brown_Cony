@@ -245,10 +245,41 @@ class Fighter {
     sparks.push(new Pop(this.x - dir * 20, this.y - 130, words[Math.random() * 4 | 0], '#ffd23f'));
   }
 
+  // 每個部位的旋轉角度（弧度，以圖片未翻轉時為準：armF/legF 是面向對手那一側）
+  pose(now) {
+    const a = { head: 0, armF: 0, armB: 0, legF: 0, legB: 0 }, sw = Math.sin(this.walk);
+    if (this.state === 'idle') {
+      if (this.onGround && this.vx) { a.legF = sw * 0.45; a.legB = -sw * 0.45; a.armF = -sw * 0.4; a.armB = -sw * 0.4; a.head = sw * 0.04; }
+      else if (this.onGround) { const b = Math.sin(now / 300) * 0.06; a.armF = -b; a.armB = b; a.head = b * 0.5; }
+      else { a.armF = -1.1; a.armB = 1.1; a.legF = -0.35; a.legB = 0.35; }
+    }
+    if (this.blocking) { a.armF = -1.9; a.armB = 0.4; a.head = 0.08; }
+    if (this.state === 'hit') { a.armF = -1.0; a.armB = 1.0; a.legF = -0.3; a.legB = 0.3; a.head = 0.15; }
+    if (this.state === 'attack') {
+      const m = this.move, wind = this.t < m.startup, e = wind ? this.t / m.startup : 1;
+      const cony = this.type === 'cony';
+      switch (this.moveName) {
+        case 'light': a.armF = wind ? 0.5 * e : -1.6; a.armB = 0.3; break;
+        case 'heavy':
+          if (cony) { a.legF = wind ? 0.5 * e : -1.4; a.legB = 0.2; a.armF = -0.6; a.armB = 0.8; }
+          else { a.armF = wind ? -2.6 * e : -1.2; a.armB = wind ? 2.6 * e : 1.2; }
+          break;
+        case 'special':
+          if (cony) { a.armF = wind ? 1.2 * e : -2.2; a.armB = 0.4; }
+          else { a.armF = wind ? -0.6 : -1.5; a.armB = wind ? 0.6 : -0.5; }
+          break;
+        case 'super':
+          if (cony) { const s = Math.sin(this.t * 0.8); a.legF = -1.2 * Math.max(0, s); a.legB = 1.2 * Math.max(0, -s); a.armF = -1.3; a.armB = 1.3; }
+          else { a.armF = -0.15; a.armB = 0.15; a.head = Math.sin(this.t * 0.3) * 0.03; }
+      }
+    }
+    if (this.hp <= 0 && roundOver) { a.armF = -1.4; a.armB = 1.4; a.legF = -0.4; a.legB = 0.4; }
+    return a;
+  }
   draw() {
-    const { x, y, facing: f } = this, img = SPR[this.type], h = SPR_H[this.type];
-    if (!img.complete || !img.naturalWidth) return;
-    const w = h * img.naturalWidth / img.naturalHeight, now = Date.now();
+    const { x, y, facing: f } = this, rig = RIG[this.type], h = SPR_H[this.type];
+    if (!rig.ready) return;
+    const now = Date.now();
     let rot = 0, sx = 1, sy = 1, dx = 0, dy = 0;
     if (this.onGround && this.state === 'idle') {
       if (this.vx) { rot = Math.sin(this.walk) * 0.07; dy = -Math.abs(Math.sin(this.walk)) * 8; }
@@ -267,9 +298,16 @@ class Fighter {
     if (this.hp <= 0 && roundOver) rot = -f * Math.PI / 2 * Math.min(1, (150 - roundOver) / 15);
 
     ctx.fillStyle = '#0004'; ctx.beginPath(); ctx.ellipse(x, GROUND, 55, 11, 0, 0, 7); ctx.fill();
-    ctx.save(); ctx.translate(x + dx, y + dy); ctx.rotate(rot); ctx.scale(f * sx, sy);
+    ctx.save(); ctx.translate(x + dx, y + dy); ctx.rotate(rot);
+    const k = h / rig.h; ctx.scale(f * sx * k, sy * k); ctx.translate(-rig.w / 2, -rig.h);
     if (superFlash && superFlash.who === this) { ctx.shadowColor = this.type === 'cony' ? '#ff7fa8' : '#ffb347'; ctx.shadowBlur = 40; }
-    ctx.drawImage(this.state === 'hit' && this.stun % 6 < 3 ? SPR_HIT[this.type] : img, -w / 2, -h, w, h);
+    const ang = this.pose(now), hit = this.state === 'hit' && this.stun % 6 < 3;
+    for (const name of ['legB', 'legF', 'armB', 'armF', 'torso', 'head']) {
+      const pt = rig.parts[name];
+      ctx.save(); ctx.translate(pt.px, pt.py); ctx.rotate(ang[name] || 0);
+      ctx.drawImage(hit ? pt.hit : pt.img, pt.x - pt.px, pt.y - pt.py);
+      ctx.restore();
+    }
     ctx.restore();
 
     // 出招時的揮擊軌跡
@@ -285,17 +323,22 @@ class Fighter {
     }
   }
 }
-// ---------- 角色圖片（從玩家提供的照片去背） ----------
-const SPR = {}, SPR_HIT = {}, SPR_H = { cony: 290, brown: 285 };
-for (const k of ['cony', 'brown']) {
-  const img = new Image();
-  img.onload = () => {
-    const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
-    const g = c.getContext('2d'); g.drawImage(img, 0, 0);
-    g.globalCompositeOperation = 'source-atop'; g.fillStyle = 'rgba(255,60,60,0.55)'; g.fillRect(0, 0, c.width, c.height);
-    SPR_HIT[k] = c;
-  };
-  img.src = `assets/${k}.webp`; SPR[k] = img; SPR_HIT[k] = img;
+// ---------- 角色圖片（從玩家提供的照片去背，再拆成頭、身體、手、腳） ----------
+const SPR_H = { cony: 290, brown: 285 };
+const RIG = {"cony":{"w":324,"h":600,"parts":{"armB":{"x":0,"y":322,"px":87,"py":359},"armF":{"x":227,"y":322,"px":252,"py":359},"legB":{"x":76,"y":479,"px":132,"py":491},"legF":{"x":172,"y":479,"px":221,"py":491},"head":{"x":12,"y":0,"px":163,"py":345},"torso":{"x":37,"y":116,"px":0,"py":0}}},"brown":{"w":352,"h":600,"parts":{"armB":{"x":6,"y":305,"px":79,"py":347},"armF":{"x":259,"y":314,"px":285,"py":355},"legB":{"x":83,"y":486,"px":134,"py":498},"legF":{"x":180,"y":486,"px":233,"py":495},"head":{"x":0,"y":0,"px":176,"py":335},"torso":{"x":4,"y":227,"px":0,"py":0}}}};
+for (const [type, rig] of Object.entries(RIG)) {
+  let left = Object.keys(rig.parts).length;
+  for (const [name, pt] of Object.entries(rig.parts)) {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+      g.globalCompositeOperation = 'source-atop'; g.fillStyle = 'rgba(255,60,60,0.55)'; g.fillRect(0, 0, c.width, c.height);
+      pt.img = img; pt.hit = c;
+      if (--left === 0) rig.ready = true;
+    };
+    img.src = `assets/${type}_${name}.webp`;
+  }
 }
 function ell(x, y, rx, ry) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, 7); ctx.fill(); }
 
